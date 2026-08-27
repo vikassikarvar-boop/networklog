@@ -23,8 +23,86 @@ import sys
 import time
 import urllib.parse
 import uuid
+import zlib
 
 import requests
+
+# FIX-TLS: curl_cffi sends the REAL Instagram Android app's TLS/JA3/HTTP2
+# fingerprint (OkHttp4/Conscrypt). Plain python-requests sends a famous bot
+# JA3 + HTTP/1.1 -> detected at the handshake, before any header is read.
+try:
+    from curl_cffi import requests as _cc_requests
+    _HAS_CURL_CFFI = True
+except Exception:
+    _HAS_CURL_CFFI = False
+
+# ---- IG Android app TLS identity (OkHttp 4 / Android 10, Conscrypt) ----
+# Verified live against tls.peet.ws echo:
+#   python-requests  -> JA4 t13d1713h1_* (bot, HTTP/1.1)
+#   this profile     -> JA4 t13d1512h2_* (OkHttp, HTTP/2)
+# FIX-JA3-CFG: exact fingerprint config-able hai. JA3 account se NAHI,
+# APP BINARY se aata hai — APK ek baar kholo (login NAHI chahiye), Wireshark
+# me ClientHello copy karo, aur env vars me do:
+#   IG_JA3="771,4865-...,0-23-...,29-23-24,0"
+#   IG_AKAMAI="4:16777216|16711681|0|m,p,a,s"
+IG_ANDROID_JA3 = os.environ.get("IG_JA3") or ",".join([
+    "771",
+    "4865-4866-4867-49195-49196-52393-49199-49200-52392-49171-49172-156-157-47-53",
+    "0-23-65281-10-11-35-16-5-13-51-45-43-21",
+    "29-23-24",
+    "0",
+])
+IG_ANDROID_AKAMAI = os.environ.get("IG_AKAMAI",
+                                   "4:16777216|16711681|0|m,p,a,s")
+IG_ANDROID_EXTRA_FP = {
+    "tls_signature_algorithms": [
+        "ecdsa_secp256r1_sha256", "rsa_pss_rsae_sha256", "rsa_pkcs1_sha256",
+        "ecdsa_secp384r1_sha384", "rsa_pss_rsae_sha384", "rsa_pkcs1_sha384",
+        "rsa_pss_rsae_sha512", "rsa_pkcs1_sha512", "rsa_pkcs1_sha1",
+    ],
+    "tls_grease": False,
+    "tls_permute_extensions": False,
+}
+
+
+class IGAndroidTlsSession:
+    """Drop-in replacement for requests.Session that speaks with the
+    Instagram Android app's OkHttp TLS/JA3 + HTTP/2 fingerprint.
+    API-compatible subset used by this engine: get/post/cookies/proxies."""
+
+    def __init__(self):
+        self._s = _cc_requests.Session()
+        self._fp = {"ja3": IG_ANDROID_JA3, "akamai": IG_ANDROID_AKAMAI,
+                    "extra_fp": dict(IG_ANDROID_EXTRA_FP)}
+
+    def _fp_kwargs(self, kw):
+        for k, v in self._fp.items():
+            kw.setdefault(k, v)
+        return kw
+
+    def get(self, url, **kw):
+        return self._s.get(url, **self._fp_kwargs(kw))
+
+    def post(self, url, **kw):
+        return self._s.post(url, **self._fp_kwargs(kw))
+
+    @property
+    def cookies(self):
+        return self._s.cookies
+
+    @property
+    def proxies(self):
+        return getattr(self._s, "proxies", {})
+
+    @proxies.setter
+    def proxies(self, value):
+        self._s.proxies = value
+
+    def close(self):
+        try:
+            self._s.close()
+        except Exception:
+            pass
 
 if sys.platform == "win32":
     try:
@@ -58,6 +136,21 @@ COUNTRY_TZ_OFFSET = {
 }
 # Default fallback if country not in table
 DEFAULT_TZ_OFFSET = 0
+
+
+def _gen_hpke_pubkey():
+    """Fresh P-256 public key (65-byte uncompressed point, base64) per session.
+    Uses the cryptography lib when available; otherwise emits a format-valid
+    random point (0x04 prefix). Real app: new keypair every fresh install."""
+    try:
+        from cryptography.hazmat.primitives.asymmetric import ec
+        from cryptography.hazmat.primitives import serialization
+        pub = ec.generate_private_key(ec.SECP256R1()).public_key()
+        raw = pub.public_bytes(serialization.Encoding.X962,
+                               serialization.PublicFormat.UncompressedPoint)
+        return base64.b64encode(raw).decode()
+    except Exception:
+        return base64.b64encode(b"\x04" + os.urandom(64)).decode()
 
 
 class Session:
@@ -145,7 +238,14 @@ class Session:
         if not self.auth or not self.uid:
             sys.exit(f"{path} me authorization/ds_user_id nahi mila")
 
-        self.s = requests.Session()
+        # FIX-TLS: use OkHttp/Android TLS fingerprint when available.
+        if _HAS_CURL_CFFI:
+            self.s = IGAndroidTlsSession()
+            self.transport = "curl_cffi (OkHttp/JA3 impersonation)"
+        else:
+            self.s = requests.Session()
+            self.transport = "PLAIN requests (BOT TLS fingerprint!) - pip install curl_cffi"
+            print("  !! WARNING: curl_cffi not installed -> sending python-requests TLS fingerprint")
         self.s.cookies.update(self.cookies)
         if self.proxy:
             self.s.proxies = {"http": self.proxy, "https": self.proxy}
@@ -160,7 +260,27 @@ class Session:
         self.fcm_token = (base64.urlsafe_b64encode(os.urandom(8)).rstrip(b"=").decode()
                           + ":APA91b"
                           + base64.urlsafe_b64encode(os.urandom(112)).rstrip(b"=").decode())
+        # FIX-CORR-1: per-session x-fb-session-id (was a hardcoded constant shared
+        # by ALL accounts -> instant cross-account correlation fingerprint).
+        # Real format: nid=<random token>;nc=1;fc=1;bc=0;
+        self.fb_session_id = (
+            "nid=" + base64.b64encode(os.urandom(9)).rstrip(b"=").decode()
+            + ";nc=1;fc=1;bc=0;"
+        )
         
+        # FIX-MEDIA: cumulative bandwidth counters (real app sends these on
+        # every API call — capture values: ~6153 kbps, growing totals)
+        self.bw_bytes = random.randint(1_500_000, 6_000_000)
+        self.bw_time_ms = random.randint(400, 1500)
+        # FIX-TELEMETRY: per-session QPL sequence counter + carrier
+        self.qpl_seq = random.randint(40, 150)
+        uk_carriers = ["EE", "Vodafone", "Three", "O2"]
+        self.carrier = random.choice(uk_carriers) if self.conn_type != "WIFI" else ""
+        # FIX-HPKE: real app generates a FRESH P-256 HPKE keypair per install
+        # for push registration. Engine had ONE hardcoded constant for ALL
+        # accounts -> correlation fingerprint. Now per-session.
+        self.hpke_pubkey = _gen_hpke_pubkey()
+
         # Write per-account identity file immediately on session creation
         self._export_identity_file()
 
@@ -213,6 +333,12 @@ class Session:
         h["ig-u-ds-user-id"] = self.uid
         # FIX-RUR: send ONLY the 3-letter cluster prefix, NOT the full cookie string
         h["ig-u-rur"] = self.rur_cluster
+        # FIX-MEDIA: bandwidth headers — real app reports cumulative usage
+        self.bw_bytes += random.randint(40_000, 180_000)
+        self.bw_time_ms += random.randint(150, 900)
+        h["x-ig-bandwidth-speed-kbps"] = f"{random.uniform(2500, 8500):.3f}"
+        h["x-ig-bandwidth-totalbytes-b"] = str(self.bw_bytes)
+        h["x-ig-bandwidth-totaltime-ms"] = str(self.bw_time_ms)
         h["accept-encoding"] = "gzip"
         h["accept"] = "*/*"
         h["priority"] = "u=3"
@@ -402,7 +528,7 @@ def cold_start(sess, verbose=False):
     step("POST", "/api/v1/push/register/", "IgApi: push/register/",
          form={"device_type": "android_fcm",
                "os_settings": "{\"notificationEnabled\":true}",
-               "hpke_pubkey": "BCkcS8F6CyKiVwQJmuLtKk1SLM2iOrvMEqfaa1ZeDe2sTVOWutzSKI+yHsSAnV7e3PQU2dtiP7AQDp95fkV8BAA=",
+               "hpke_pubkey": sess.hpke_pubkey,
                "device_sub_type": "0", "hpke_ciphersuite": "1001000010000",
                "device_token": sess.fcm_token,
                "guid": duuid, "request_id": str(uuid.uuid4()), "_uuid": duuid,
@@ -452,8 +578,19 @@ def upload_image(sess, img_bytes, w, h, is_story):
 
 
 def configure(sess, upload_id, w, h, is_story, caption=""):
-    dev = {"manufacturer": "Xiaomi", "model": "2203121C",
-           "android_version": 28, "android_release": "9"}
+    # FIX-CORR-2: use the session's OWN device identity (was hardcoded
+    # Xiaomi 2203121C / Android 9, conflicting with the per-account UA).
+    # In IG's configure payload: "android_version" = API level (int),
+    # "android_release" = Android version string.
+    di = sess._device_info_snapshot
+    try:
+        _api = int(di.get("api_level", 28))
+    except Exception:
+        _api = 28
+    dev = {"manufacturer": di.get("manufacturer", "Xiaomi"),
+           "model": di.get("model", "2203121C"),
+           "android_version": _api,
+           "android_release": str(di.get("android_version", "9"))}
     now = int(time.time())
     obj = {
         "supported_capabilities_new": SUPPORTED_CAPS,
@@ -475,7 +612,7 @@ def configure(sess, upload_id, w, h, is_story, caption=""):
             "has_camera_metadata": 1, "camera_entry_point": 11,
             "original_media_type": "1", "camera_session_id": str(uuid.uuid4()),
             "original_height": h, "original_width": w,
-            "camera_model": "2203121C", "camera_make": "Xiaomi",
+            "camera_model": dev["model"], "camera_make": dev["manufacturer"],
             "camera_position": "front", "capture_type": "normal",
             "creation_surface": "camera", "creation_tool_info": [],
             "configure_mode": 1, "source_type": 3, "audience": "default",
@@ -544,6 +681,144 @@ def story_seen(sess, media_pk, owner, taken_at, module=None):
     return r.status_code == 200
 
 
+# =====================================================================
+# FIX-MEDIA: real app downloads post/story media from CDN (NO authorization
+# header — verified in capture; friendly-name TigonDownloadService).
+# Without this: "liked a post but never fetched its image" = bot signal.
+# =====================================================================
+def download_media(sess, url, friendly="TigonDownloadService"):
+    """Fetch media from CDN exactly like the app's Tigon download service.
+    Non-fatal: any failure returns 0 bytes, session continues."""
+    if not url:
+        return 0
+    try:
+        h = {
+            "user-agent": sess.user_agent,
+            "accept-encoding": "gzip, deflate",
+            "accept": "*/*",
+            "priority": "u=3, i",
+            "x-fb-client-ip": "True",
+            "x-fb-server-cluster": "True",
+            "x-fb-friendly-name": friendly,
+            "x-fb-http-engine": "Tigon/MNS/TCP",
+            "x-fb-conn-uuid-client": sess.conn_uuid,
+            "x-fb-rmd": "state=URL_ELIGIBLE",
+            "x-fb-request-analytics-tags": json.dumps(
+                {"network_tags": {"product": "567067343352427",
+                                  "purpose": "none", "retry_attempt": "0"}},
+                separators=(",", ":")),
+        }
+        r = sess.s.get(url, headers=h, timeout=30)
+        n = len(r.content or b"") if r.status_code == 200 else 0
+        sess.bw_bytes += n  # real app counts downloaded bytes too
+        if n:
+            print(f"[media download   ] {r.status_code} {n//1024}KB")
+        return n
+    except Exception as e:
+        print(f"[media download   ] skipped ({type(e).__name__})")
+        return 0
+
+
+def media_first_url(item):
+    """Pull the best media URL out of a post/story item dict."""
+    try:
+        cands = (item.get("image_versions2") or {}).get("candidates") or []
+        if cands:
+            return cands[0].get("url", "")
+        vids = item.get("video_versions") or []
+        if vids:
+            return vids[0].get("url", "")
+    except Exception:
+        pass
+    return ""
+
+
+# =====================================================================
+# FIX-TELEMETRY: real app POSTs QPL client events to graph.instagram.com
+# (15 calls in one 5-min capture). Schema decoded from real capture:
+# message = base64(zlib(JSON with device/session identity + event data)).
+# Best-effort: 'claims' + 'config_checksum' omitted (session-bound values).
+# =====================================================================
+APP_ACCESS_TOKEN = "567067343352427|f249176f09e26ce54212b472dbab8fa8"
+
+def telemetry_beat(sess, module="feed_timeline", dry_run=False):
+    """Send one QPL client-event batch like the real app does. Non-fatal."""
+    try:
+        now_ms = int(time.time() * 1000)
+        sess.qpl_seq += 1
+        di = sess._device_info_snapshot
+        payload = {
+            "time": now_ms,
+            "app_id": "567067343352427",
+            "app_ver": di.get("app_version", "400.0.0.49.68"),
+            "build_num": int(di.get("build_number", 799297105) or 799297105),
+            "consent_state": 0,
+            "device": di.get("model", ""),
+            "os_ver": str(di.get("android_version", "")),
+            "device_id": sess.device_uuid,
+            "family_device_id": sess.family_uuid,
+            "session_id": sess.pigeon,
+            "seq": sess.qpl_seq,
+            "app_uid": sess.uid,
+            "data": [{
+                "extra": {
+                    "pigeon_reserved_keyword_module": module,
+                    "activity_time": now_ms - random.randint(500, 4000),
+                    "last_activity_time": now_ms - random.randint(60000, 900000),
+                    "last_foreground_time": now_ms - random.randint(900000, 3600000),
+                    "pk": sess.uid,
+                    "release_channel": "prod",
+                    "radio_type": f"{sess.conn_type}-UNKNOWN",
+                    "pigeon_reserved_keyword_requested_latency": -2.0,
+                    "pigeon_reserved_keyword_log_type": "client_event",
+                    "pigeon_reserved_keyword_bg": "false",
+                },
+                "log_type": "client_event", "bg": "false",
+                "time": now_ms / 1000.0, "module": module,
+                "name": "immediate_active_seconds",
+                "sampling_rate": 1, "tags": 8388608,
+            }],
+            "tier": "micro_batch",
+            "sent_time": now_ms / 1000.0,
+            "carrier": sess.carrier or "Unknown",
+            "conn": sess.conn_type,
+            "config_version": "v2",
+            "qpl_config_version": "v7",
+        }
+        message = base64.b64encode(zlib.compress(
+            json.dumps(payload, separators=(",", ":")).encode())).decode()
+        form = {
+            "access_token": APP_ACCESS_TOKEN,
+            "format": "json", "ffdb_token": "", "compressed": "1",
+            "sent_time": f"{time.time():.3f}", "message": message,
+        }
+        if dry_run:
+            return form
+        url = "https://graph.instagram.com/logging_client_events"
+        h = {
+            "user-agent": sess.user_agent,
+            "accept-language": sess.accept_lang,
+            "content-type": "application/x-www-form-urlencoded; charset=UTF-8",
+            "priority": "u=5, i",
+            "x-fb-client-ip": "True",
+            "x-fb-server-cluster": "True",
+            "x-fb-connection-type": sess.conn_type,
+            "x-ig-connection-type": sess.conn_type,
+            "x-fb-friendly-name": "undefined:analytics",
+            "x-ig-app-id": "567067343352427",
+            "x-ig-capabilities": "3brTv10=",
+            "x-tigon-is-retry": "False",
+            "accept-encoding": "gzip",
+        }
+        body = urllib.parse.urlencode(form).encode()
+        r = sess.s.post(url, headers=h, data=body, timeout=30)
+        print(f"[telemetry        ] {r.status_code}")
+        return r.status_code
+    except Exception as e:
+        print(f"[telemetry        ] skipped ({type(e).__name__})")
+        return 0
+
+
 LIKE_MODULES = ["feed_timeline", "profile", "feed_contextual_post", "explore_popular",
                 "video_viewer", "feed_short_video", "reel_feed_timeline"]
 
@@ -572,7 +847,7 @@ def like(sess, media_id, pct_watched=None):
     }
     r = sess.post_form(f"/api/v1/media/{media_id}/like/", obj,
                        f"IgApi: media/{media_id}/like/", extra_form={"d": "0"},
-                       extra_headers={"x-fb-session-id": "nid=eb61LiYjtu+6;nc=1;fc=1;bc=0;"})
+                       extra_headers={"x-fb-session-id": sess.fb_session_id})
     print(f"[like             ] {r.status_code} {r.text[:100]}")
     return r
 

@@ -41,6 +41,13 @@ BLOCK_MARKERS = ("rate_limit_error", "feedback_required", "action_block",
                  "challenge_required", "checkpoint_required", "sentry_block",
                  "try again later", "comment_not_allowed")
 
+# FIX-SOFTLIMIT: the REAL APP shows a toast and the HUMAN STOPS when IG says
+# "too fast / comments limited". Engine previously ignored these (crab died
+# after 6 ignored warnings). Now: first soft warning = session ends + rest.
+SOFT_MARKERS = ("commenting too fast", "comments limited", "comments_limit",
+                "wait a few minutes", "slow down", "temporarily blocked",
+                "too many requests", "you're going too fast")
+
 LOG_LOCK = threading.Lock()
 STATE_LOCK = threading.Lock()
 PRINT_LOCK = threading.Lock()
@@ -100,6 +107,15 @@ def is_blocked(resp):
     if resp is None:
         return False
     return resp.status_code == 429 or any(m in resp.text for m in BLOCK_MARKERS)
+
+
+def is_soft_limit(resp):
+    """Soft rate warning ('commenting too fast', 'comments limited'...) —
+    what a real user sees as a toast and STOPS for."""
+    if resp is None:
+        return False
+    txt = resp.text.lower()
+    return any(m in txt for m in SOFT_MARKERS)
 
 
 class ThreadSafeCSVLog:
@@ -180,15 +196,19 @@ def get_user_stories(sess, user_pk):
 
 
 def get_media_owner_pk(sess, media_id):
+    """Returns (owner_pk, media_url) — media URL used for the realistic
+    CDN download before liking/commenting (FIX-MEDIA)."""
     r = sess.get(f"/api/v1/media/{media_id}/info/", "IgApi: media/info/")
     if r.status_code == 200:
         try:
             items = r.json().get("items", [])
             if items:
-                return str(items[0].get("user", {}).get("pk", ""))
+                owner = str(items[0].get("user", {}).get("pk", ""))
+                murl = A.media_first_url(items[0])
+                return owner, murl
         except Exception:
             pass
-    return ""
+    return "", ""
 
 
 def shift_time(tstr, minutes):
@@ -287,6 +307,10 @@ def run_account_session(acct_cfg, gen_cfg, master_data, state, log, day, ses_idx
     t_init_browse = seeded_uniform(25.0, 45.0)
     time.sleep(t_init_browse)
 
+    # FIX-TELEMETRY: real app sends QPL client events continuously
+    # (15 batches in one 5-min capture). One beat after cold start.
+    A.telemetry_beat(sess, module="feed_timeline")
+
     actions_spec = acct_cfg.get("actions_per_session", {})
     planned = []
     for act, (lo, hi) in actions_spec.items():
@@ -374,6 +398,11 @@ def run_account_session(acct_cfg, gen_cfg, master_data, state, log, day, ses_idx
         gap = max(seeded_uniform(*int_range), MIN_GAP.get(act, 90))
         sleep_with_passive_browsing(sess, gap, gen_cfg, prefix)
 
+        # FIX-TELEMETRY: occasional QPL beat mid-session (~1 in 4 gaps)
+        if seq > 0 and seq % 4 == 0 and seeded_uniform(0, 1) < 0.75:
+            A.telemetry_beat(sess, module=random.choice(
+                ["feed_timeline", "story_viewer", "profile_page"]))
+
         seq += 1
         target_str = ""
         media_id = ""
@@ -430,6 +459,9 @@ def run_account_session(acct_cfg, gen_cfg, master_data, state, log, day, ses_idx
                 own = str(st0.get("user", {}).get("pk", u_pk))
                 media_id = pk
 
+                # FIX-MEDIA: real app downloads the story media while viewing
+                A.download_media(sess, A.media_first_url(st0))
+
                 # FIX #11: realistic story-view dwell (4-12s, not 3-7s)
                 drange = dwell_map.get("seen", [4.0, 12.0])
                 dwell = seeded_uniform(*drange)
@@ -473,14 +505,19 @@ def run_account_session(acct_cfg, gen_cfg, master_data, state, log, day, ses_idx
                 dwell = seeded_uniform(*drange)
                 time.sleep(dwell)
 
-                owner_pk = get_media_owner_pk(sess, mid)
+                owner_pk, post_media_url = get_media_owner_pk(sess, mid)
                 full_media_id = f"{mid}_{owner_pk}" if owner_pk else mid
                 media_id = mid
+
+                # FIX-MEDIA: real app downloads the post's media before
+                # liking/commenting (image fetched while user looks at it)
+                A.download_media(sess, post_media_url)
 
                 if act == "like":
                     r = A.like(sess, full_media_id)
                     status, ok, note = r.status_code, '"ok"' in r.text.lower(), r.text[:100]
                     blocked = is_blocked(r)
+                    soft = is_soft_limit(r)
                     if ok:
                         with STATE_LOCK:
                             acct_state["used_posts"].append(target_url)
@@ -497,6 +534,7 @@ def run_account_session(acct_cfg, gen_cfg, master_data, state, log, day, ses_idx
                     r = A.comment(sess, full_media_id, comment_text)
                     status, ok, note = r.status_code, '"ok"' in r.text.lower(), r.text[:100]
                     blocked = is_blocked(r)
+                    soft = is_soft_limit(r)
                     if ok:
                         with STATE_LOCK:
                             acct_state["used_posts"].append(target_url)
@@ -521,6 +559,23 @@ def run_account_session(acct_cfg, gen_cfg, master_data, state, log, day, ses_idx
             if not found_post and not ok:
                 t_print(f"   {prefix} #{seq:02d} {act} -> Target restricted, skipping.")
                 continue
+
+        # FIX-SOFTLIMIT: human behavior on "too fast" — STOP, don't retry.
+        if not blocked and soft:
+            cd_min = random.uniform(60, 180)
+            with STATE_LOCK:
+                state.setdefault("cooldowns", {})[acct_name] = time.time() + cd_min * 60
+            try:
+                log.row(time.strftime("%Y-%m-%d %H:%M:%S"),
+                        day, ses_idx, acct_id, acct_name, profile, act,
+                        target_str, media_id, status, False, True,
+                        0, 0, comment_text, "SOFT_LIMIT->stop")
+            except Exception:
+                pass
+            t_print(f"   ⚠️ {prefix} #{seq:02d} {act} -> SOFT LIMIT (too fast) — "
+                    f"stopping like a human, resting {cd_min:.0f}m")
+            save_state(state)
+            break
 
         # Safe logging call
         try:
